@@ -43,6 +43,27 @@ class NASManager:
             # In use = permission is fine
             return True
 
+    def _smbd_running(self):
+        """True if a real smbd process is alive (same /proc scan as kill)."""
+        try:
+            me = str(os.getpid())
+            for ent in os.listdir("/proc"):
+                if not ent.isdigit() or ent == me:
+                    continue
+                try:
+                    with open(os.path.join("/proc", ent, "cmdline"), "rb") as f:
+                        cmd = f.read().replace(b"\0", b" ").decode(errors="replace")
+                    if "smbd" not in cmd:
+                        continue
+                    if any(x in cmd for x in ("smbd_untag", "log.smbd", "smbd.log", "app.py")):
+                        continue
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            return False
+        return False
+
     def _kill_smbd(self):
         """Kill old smbd. pkill -x is UNRELIABLE here (comm never matches 'smbd'
         exactly on Termux) -> scan /proc cmdlines directly."""
@@ -437,6 +458,26 @@ class NASManager:
             config_path = os.path.join(os.path.expanduser("~"), ".smb", "smb.conf")
             log_file = os.path.join(os.path.expanduser("~"), ".smb", "nmbd.log")
 
+            # RESTART-SAFE: keep an already-running nmbd (no pkill+relaunch
+            # on app restart). /proc scan - this phone's pkill -0 is broken.
+            try:
+                me = str(os.getpid())
+                for ent in os.listdir("/proc"):
+                    if not ent.isdigit() or ent == me:
+                        continue
+                    try:
+                        with open(os.path.join("/proc", ent, "cmdline"), "rb") as f:
+                            cmd = f.read().replace(b"\0", b" ").decode(errors="replace")
+                        # wrapper shells carry '>> nmbd.log' in argv - skip them
+                        if "nmbd" in cmd and "nmbd.log" not in cmd and "app.py" not in cmd:
+                            self.dbg("nmbd: already running - keeping existing instance")
+                            self.logger.info("[OK] nmbd running (kept, NOT restarted) - NetBIOS 'CAMNAS'")
+                            return
+                    except Exception:
+                        continue
+            except Exception as e:
+                self.dbg(f"nmbd: running-check failed: {e}")
+
             # Kill any old instance (fresh smb.conf must be loaded)
             for as_root in (True, False):
                 try:
@@ -521,6 +562,17 @@ class NASManager:
                 self.logger.error("Samba config invalid - SMB cannot start. Check ~/.smb/smb.conf")
                 return
             config_path = os.path.join(os.path.expanduser("~"), ".smb", "smb.conf")
+
+            # RESTART-SAFE: if a healthy smbd from a previous run is already
+            # serving, KEEP it (no kill+relaunch churn on app restart).
+            # smbd re-reads smb.conf per new session, so conf edits still apply.
+            smb_port = self._smb_port()
+            if self._smbd_running() and self._check_port(smb_port):
+                self.dbg("start_termux: smbd already running - keeping existing instance")
+                self.logger.info(f"[OK] smbd running (kept, NOT restarted) - port {smb_port} LISTENING")
+                self._start_nmbd_termux()
+                self._start_wsdd_discovery()
+                return
 
             # Kill old smbd (may have old broken config / no shim)
             self._kill_smbd()
@@ -697,8 +749,24 @@ class NASManager:
             su = _sh.which("su")
             # Idempotent: app startup path may invoke this twice - keep the
             # first instance (single log writer) instead of kill+restart churn.
+            # Primary check = /proc scan (this phone's `pkill -0` is broken).
             running = False
-            if su:
+            try:
+                me = str(os.getpid())
+                for ent in os.listdir("/proc"):
+                    if not ent.isdigit() or ent == me:
+                        continue
+                    try:
+                        with open(os.path.join("/proc", ent, "cmdline"), "rb") as f:
+                            c = f.read().replace(b"\0", b" ").decode(errors="replace")
+                        if "wsdd" in c and "app.py" not in c and "pkill" not in c:
+                            running = True
+                            break
+                    except Exception:
+                        continue
+            except Exception as e:
+                self.dbg(f"wsdd: running-check failed: {e}")
+            if not running and su:
                 running = subprocess.run([su, "-c", "pkill -0 -f '[b]in/wsdd'"],
                                          capture_output=True, timeout=10).returncode == 0
             if not running:
