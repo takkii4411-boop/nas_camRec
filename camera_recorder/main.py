@@ -21,6 +21,9 @@ from camera_recorder.utils.storage_check import get_storage_status
 
 class CameraNASManager:
     def __init__(self):
+        # must run FIRST - before ports/smbd/ffmpeg get touched
+        _stop_stale_instance()
+        _write_pidfile()
         self.logger = LoggerManager.get_logger("CAMERANAS_MAIN")
         self.config = load_config()
         self.db = CameraDatabase()
@@ -176,7 +179,78 @@ class CameraNASManager:
             "timestamp": datetime.now().isoformat()
         }
 
+PID_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "system", "app.pid")
+
+
+def _stop_stale_instance():
+    """Only ONE app.py may run. A leftover instance holds port 8080
+    (Address already in use), duplicates smbd churn and spawns a second
+    ffmpeg fighting for the camera session."""
+    try:
+        if not os.path.exists(PID_PATH):
+            return
+        with open(PID_PATH) as f:
+            old = f.read().strip()
+        if not old.isdigit():
+            return
+        old = int(old)
+        if old == os.getpid():
+            return
+        # verify it is really our app before killing (pid reuse safety)
+        cmd_path = f"/proc/{old}/cmdline"
+        if os.path.exists(cmd_path):
+            try:
+                with open(cmd_path, "rb") as f:
+                    cmdline = f.read().decode(errors="replace")
+                if "python" not in cmdline and "app.py" not in cmdline:
+                    return
+            except Exception:
+                return
+        os.kill(old, signal.SIGTERM)
+        for _ in range(20):
+            time.sleep(0.25)
+            try:
+                os.kill(old, 0)
+            except (ProcessLookupError, OSError):
+                print(f"[OK] Stopped old CameraNAS instance (pid {old})")
+                return
+        try:
+            os.kill(old, signal.SIGKILL)
+            print(f"[OK] Killed old CameraNAS instance (pid {old})")
+        except Exception:
+            pass
+    except ProcessLookupError:
+        pass
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[pidfile] stale-instance check skipped: {e}")
+
+
+def _write_pidfile():
+    try:
+        os.makedirs(os.path.dirname(PID_PATH), exist_ok=True)
+        with open(PID_PATH, "w") as f:
+            f.write(str(os.getpid()))
+
+        import atexit
+
+        def _cleanup():
+            try:
+                if os.path.exists(PID_PATH):
+                    with open(PID_PATH) as f:
+                        if f.read().strip() == str(os.getpid()):
+                            os.remove(PID_PATH)
+            except Exception:
+                pass
+        atexit.register(_cleanup)
+    except Exception as e:
+        print(f"[pidfile] write failed: {e}")
+
+
 def main():
+    _stop_stale_instance()
+    _write_pidfile()
     manager = CameraNASManager()
     manager.start_all()
 

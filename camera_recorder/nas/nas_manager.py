@@ -174,20 +174,26 @@ class NASManager:
         self.dbg(f"create_samba_user: user='{username}' pass='{'*' * len(password)}' plat={plat}")
         try:
             if plat == "termux":
-                # Best-effort: Termux has no useradd; share also works as GUEST (no login)
-                result = subprocess.run(["smbpasswd", "-l"], capture_output=True, text=True, timeout=5)
-                self.dbg(f"smbpasswd -l rc={result.returncode} out='{result.stdout.strip()[:100]}' err='{result.stderr.strip()[:100]}'")
-                if username not in result.stdout:
-                    r = subprocess.run(
-                        ["smbpasswd", "-a", "-s", username],
-                        input=f"{password}\n{password}\n".encode(),
-                        capture_output=True, timeout=10
-                    )
-                    self.dbg(f"smbpasswd -a {username} rc={r.returncode} err='{r.stderr.decode(errors='replace').strip()[:200]}'")
-                    if r.returncode == 0:
-                        self.logger.info(f"[OK] Samba user '{username}' added")
-                    else:
-                        self.logger.info(f"Samba user '{username}' not added (OK - GUEST access enabled)")
+                # NOTE: `smbpasswd -l` does not exist (rc=1, always failed).
+                # Add/update the user in OUR config's passdb so admin login
+                # works (guest already works without it). -a is idempotent:
+                # re-running just updates the password.
+                conf = os.path.join(os.path.expanduser("~"), ".smb", "smb.conf")
+                cmd = ["smbpasswd", "-a", "-s"]
+                if os.path.exists(conf):
+                    cmd += ["-c", conf]
+                cmd.append(username)
+                r = subprocess.run(
+                    cmd,
+                    input=f"{password}\n{password}\n".encode(),
+                    capture_output=True, timeout=10
+                )
+                err = r.stderr.decode(errors="replace").strip()[:200]
+                self.dbg(f"smbpasswd -a {username} rc={r.returncode} err='{err}'")
+                if r.returncode == 0:
+                    self.logger.info(f"[OK] Samba user '{username}' added (admin login + guest both work)")
+                else:
+                    self.logger.info(f"Samba user '{username}' not added (GUEST access still works)")
             elif plat == "linux":
                 subprocess.run(
                     ["sudo", "smbpasswd", "-a", "-s", username],
@@ -206,8 +212,13 @@ class NASManager:
         self.logger.info(f"Setting Samba password for user '{username}'")
         try:
             if is_termux():
+                conf = os.path.join(os.path.expanduser("~"), ".smb", "smb.conf")
+                cmd = ["smbpasswd"]
+                if os.path.exists(conf):
+                    cmd += ["-c", conf]
+                cmd.append(username)
                 subprocess.run(
-                    ["smbpasswd", username],
+                    cmd,
                     input=f"{new_password}\n{new_password}\n".encode(),
                     capture_output=True, timeout=10
                 )
@@ -256,11 +267,15 @@ class NASManager:
         smb_pass = os.environ.get("NAS_SMB_PASS", self.config.get('samba', {}).get('password', 'naspass'))
         share_name = self.config.get('samba', {}).get('share_name', 'CameraNAS')
         self.dbg(f"setup_samba: plat={plat} user='{smb_user}' share='{share_name}' config_keys={list(self.config.keys())}")
-        self._create_samba_user(smb_user, smb_pass, plat)
 
         if plat == "termux":
-            return self._setup_samba_termux()
-        elif plat == "linux":
+            # setup FIRST so ~/.smb/smb.conf exists -> smbpasswd -c uses our
+            # config (passdb in state dir) instead of a missing default conf
+            ok = self._setup_samba_termux()
+            self._create_samba_user(smb_user, smb_pass, plat)
+            return ok
+        self._create_samba_user(smb_user, smb_pass, plat)
+        if plat == "linux":
             return self._setup_samba_linux()
         elif plat == "windows":
             return self._setup_samba_windows()
@@ -898,6 +913,15 @@ class NASManager:
             self.logger.info(f"Access: http://{ip}:{port}/")
             self.logger.info(f"  Mi camera: http://{ip}:{port}/xiaomi_camera_videos/")
             self.logger.info(f"  CP Plus:   http://{ip}:{port}/cpplus_videos/")
+        except OSError as e:
+            self.dbg(f"http: FAILED {type(e).__name__}: {e}")
+            if getattr(e, "errno", None) == 98 or "in use" in str(e).lower():
+                self.logger.error(
+                    "HTTP port 8080 held by ANOTHER app.py instance "
+                    "(stale zombie) — this instance cannot serve. "
+                    "Fix: pkill -f app.py, then start ONE instance")
+            else:
+                self.logger.error(f"HTTP server failed: {e}")
         except Exception as e:
             self.dbg(f"http: FAILED {type(e).__name__}: {e}")
             self.logger.error(f"HTTP server failed: {e}")

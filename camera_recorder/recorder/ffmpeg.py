@@ -65,7 +65,6 @@ class FFmpegController:
         cmd = [
             "ffmpeg",
             "-rtsp_transport", "tcp",
-            "-rtsp_keepalive_timeout", "30",
             "-fflags", "+genpts",
             "-probesize", "5M",
             "-analyzeduration", "5000000",
@@ -106,6 +105,7 @@ class FFmpegController:
                 except Exception:
                     pass
             self._err_file = open(err_path, "ab")
+            self._err_path = err_path
             self.process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
@@ -206,6 +206,34 @@ class FFmpegController:
 
         threading.Thread(target=report, daemon=True).start()
 
+    def _last_err_line(self):
+        """Surface the real ffmpeg failure reason into the main log so the
+        cause is visible in the terminal (err.log stays as full detail)."""
+        path = getattr(self, "_err_path", None)
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 4096))
+                tail = f.read().decode(errors="replace")
+        except Exception:
+            return None
+        keys = ("error", "failed", "unauthorized", "denied", "refused",
+                "timeout", "invalid", "not found", "no route", "busy")
+        line = None
+        for ln in tail.splitlines():
+            low = ln.lower()
+            if any(k in low for k in keys):
+                line = ln.strip()
+        if line is None:
+            nonempty = [ln.strip() for ln in tail.splitlines() if ln.strip()]
+            line = nonempty[-1] if nonempty else None
+        if line and len(line) > 180:
+            line = line[:180] + "..."
+        return line
+
     def _monitor_process(self):
         def monitor():
             while self.running:
@@ -230,6 +258,19 @@ class FFmpegController:
                     self.logger.warning(
                         f"FFmpeg exited for {self.camera_id} "
                         f"(code: {exit_code}, lived {int(lived)}s)")
+                    # Real reason from ffmpeg stderr, right in this log:
+                    reason = self._last_err_line()
+                    if reason:
+                        self.logger.error(f"FFmpeg says: {reason}")
+                    if exit_code == 8 and reason and "401" in reason:
+                        self.logger.error(
+                            "RTSP AUTH FAILED (401) — password in "
+                            "system/config/.env is wrong (camera expects "
+                            "admin / admin1234), fix .env and restart")
+                    elif exit_code == 8 and not reason:
+                        self.logger.error(
+                            "exit 8 = RTSP server rejected request "
+                            "(401/404 class) — check .env RTSP_URL + password")
                     # SECURITY RULE: NEVER give up - keep retrying forever.
                     # Backoff 3,6,12,24,48 then capped at 60s => worst-case
                     # footage gap ~60s (vs old 10-min blackout).
