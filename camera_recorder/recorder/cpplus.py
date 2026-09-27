@@ -81,27 +81,14 @@ class CPPlusRecorder:
         return True
 
     def _record_loop(self):
-        # ONE start line at app boot; restarts/errors are logged by FFmpeg
-        # monitor only when they actually happen (no per-second spam).
+        # ONE start line at app boot. Recovery forever owned by the FFmpeg
+        # monitor (infinite 60s-capped retry - never gives up, no 10-min hole).
         self.logger.info(
             f"CP Plus recording STARTED: {self.camera_id} | "
             f"segment={self.segment_duration}s | continuous | -> {self.output_dir}")
         self.ffmpeg.start_recording()
         while self.running:
             time.sleep(10)
-            exhausted = (self.ffmpeg.reconnect_count >= self.ffmpeg.max_reconnects)
-            if not self.ffmpeg.is_recording() and not self.ffmpeg.running and exhausted:
-                # FFmpeg monitor exhausted its reconnects - probe again after 10 min
-                self.logger.warning(
-                    f"CP Plus {self.camera_id} NOT recording (reconnects exhausted) "
-                    f"— retry in 10 min")
-                for _ in range(60):
-                    if not self.running:
-                        return
-                    time.sleep(10)
-                if self.running:
-                    self.ffmpeg.reconnect_count = 0
-                    self.ffmpeg.start_recording()
 
     def stop(self):
         self.running = False

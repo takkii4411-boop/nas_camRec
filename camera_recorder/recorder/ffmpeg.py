@@ -1,5 +1,6 @@
 import subprocess
 import os
+import sys
 import time
 import threading
 from pathlib import Path
@@ -64,13 +65,16 @@ class FFmpegController:
         cmd = [
             "ffmpeg",
             "-rtsp_transport", "tcp",
-            "-probesize", "1M",
-            "-analyzeduration", "3000000",
+            "-rtsp_keepalive_timeout", "30",
+            "-fflags", "+genpts",
+            "-probesize", "5M",
+            "-analyzeduration", "5000000",
             "-i", self.rtsp_url,
             "-map", "0:v:0",
             "-map", "0:a:0?",
             "-c:v", "copy",
             "-c:a", "aac",
+            "-avoid_negative_ts", "make_zero",
             "-max_muxing_queue_size", "1024",
             "-f", "segment",
             "-segment_time", str(self.segment_duration),
@@ -111,11 +115,55 @@ class FFmpegController:
             self.running = True
             self._started_at = time.time()
             self._start_segment_reporter()
+            self._start_progress_bar()
             self._monitor_process()
             return True
         except Exception as e:
             self.logger.error(f"Failed to start FFmpeg: {e}")
             return False
+
+    def _start_progress_bar(self):
+        """pip-style live bar: fills 1..60s for the current segment, then the
+        'Segment complete' line takes over. Hides itself when recording is
+        NOT alive (problem state). Only on an interactive terminal - keeps
+        nohup/background logs clean."""
+        if getattr(self, "_bar_started", False):
+            return
+        try:
+            if not sys.stdout.isatty():
+                return
+        except Exception:
+            return
+        self._bar_started = True
+        dur = self.segment_duration
+
+        def tick():
+            while getattr(self, "_reporter_alive", False):
+                alive = (self.running and self.process
+                         and self.process.poll() is None)
+                try:
+                    if alive:
+                        el = time.time() - getattr(self, "_started_at", time.time())
+                        seg = int(el) % dur
+                        filled = int((el % dur) / dur * 24)
+                        bar = "█" * filled + "░" * (24 - filled)
+                        sys.stdout.write(
+                            f"\r  CP Plus [{bar}] {seg + 1:2d}/{dur}s ")
+                        sys.stdout.flush()
+                    else:
+                        sys.stdout.write("\r" + " " * 70 + "\r")
+                        sys.stdout.flush()
+                except Exception:
+                    pass
+                time.sleep(1)
+            # hidden - clear the line for the logger line
+            try:
+                sys.stdout.write("\r" + " " * 70 + "\r")
+                sys.stdout.flush()
+            except Exception:
+                pass
+
+        threading.Thread(target=tick, daemon=True).start()
 
     def _start_segment_reporter(self):
         """Log ONE line each time a 60s segment file is finished
@@ -165,26 +213,36 @@ class FFmpegController:
                     exit_code = self.process.returncode
                     lived = time.time() - getattr(self, "_started_at", time.time())
                     self.running = False
-                    if lived > 300:
-                        self.reconnect_count = 0  # stable run - forget past failures
+                    # code 0 + ran a while = camera closed session normally
+                    # (server-side cycle) - NOT a failure: reconnect fast,
+                    # reset counter, never escalate to "giving up".
+                    clean_close = (exit_code == 0 and lived >= 60)
+                    if lived > 300 or clean_close:
+                        self.reconnect_count = 0
+                    if clean_close:
+                        self.logger.info(
+                            f"Camera closed RTSP session (normal, lived {int(lived)}s) "
+                            f"— reconnecting in 2s")
+                        time.sleep(2)
+                        if not getattr(self, "_stop_requested", False):
+                            self.start_recording()
+                        break
                     self.logger.warning(
                         f"FFmpeg exited for {self.camera_id} "
                         f"(code: {exit_code}, lived {int(lived)}s)")
-                    if self.reconnect_count < self.max_reconnects:
-                        self.reconnect_count += 1
-                        # backoff: 3,6,12,24,48,60... sec - accumulates across
-                        # quick failures (no reset on start), escalates properly
-                        delay = min(3 * (2 ** (self.reconnect_count - 1)), 60)
+                    # SECURITY RULE: NEVER give up - keep retrying forever.
+                    # Backoff 3,6,12,24,48 then capped at 60s => worst-case
+                    # footage gap ~60s (vs old 10-min blackout).
+                    self.reconnect_count += 1
+                    delay = min(3 * (2 ** (self.reconnect_count - 1)), 60)
+                    # verbose for first attempts, then quiet (1 log per ~10 min)
+                    if self.reconnect_count <= 5 or self.reconnect_count % 10 == 0:
                         self.logger.info(
                             f"Reconnecting {self.camera_id} in {delay}s "
-                            f"({self.reconnect_count}/{self.max_reconnects})")
-                        time.sleep(delay)
-                        if not getattr(self, "_stop_requested", False):
-                            self.start_recording()
-                    else:
-                        self.logger.error(
-                            f"Max reconnects ({self.max_reconnects}) reached for {self.camera_id} "
-                            f"— giving up until app restart")
+                            f"(attempt {self.reconnect_count})")
+                    time.sleep(delay)
+                    if not getattr(self, "_stop_requested", False):
+                        self.start_recording()
                     break
                 time.sleep(2)
         threading.Thread(target=monitor, daemon=True).start()
@@ -193,6 +251,7 @@ class FFmpegController:
         self._stop_requested = True
         self._reporter_alive = False
         self._reporter_started = False
+        self._bar_started = False
         if self.process and self.running:
             try:
                 self.process.terminate()
