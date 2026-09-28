@@ -42,12 +42,37 @@ def _acquire_wake_lock():
         return False
 
 
+def _protect_from_lmk():
+    """wake-lock only stops SLEEP - Android LMK still kills python/ffmpeg under
+    memory pressure (heavy ffmpeg -> app.py silently dies -> 8080 + recording
+    gone while root daemons smbd/nmbd/wsdd stay up). Root can pin
+    oom_score_adj=-900; ffmpeg spawned later INHERITS it. True=ok False=fail
+    None=no su."""
+    try:
+        import shutil as _sh
+        if not _sh.which("su"):
+            return None
+        pid = os.getpid()
+        r = subprocess.run(["su", "-c", f"echo -900 > /proc/{pid}/oom_score_adj"],
+                           capture_output=True, timeout=5)
+        if r.returncode == 0:
+            print("[OK] LMK protection: oom_score_adj=-900 (survives memory pressure)")
+            return True
+        err = r.stderr.decode(errors="replace").strip()[:80]
+        print(f"[WARN] LMK protection rc={r.returncode} {err}")
+        return False
+    except Exception as e:
+        print(f"[WARN] LMK protection skipped: {e}")
+        return False
+
+
 class CameraNASManager:
     def __init__(self):
         # must run FIRST - before ports/smbd/ffmpeg get touched
         _stop_stale_instance()
         _write_pidfile()
         self._wake_lock = _acquire_wake_lock()
+        self._lmk = _protect_from_lmk()
         self.logger = LoggerManager.get_logger("CAMERANAS_MAIN")
         self.config = load_config()
         self.db = CameraDatabase()
@@ -155,6 +180,8 @@ class CameraNASManager:
             L = self.logger.info
             L("========== STARTUP SUMMARY ==========")
             L(f"  wake-lock:  {'ON (auto)' if wl else ('not installed' if wl is None else 'FAILED')}")
+            lmk = getattr(self, "_lmk", None)
+            L(f"  LMK-safe:   {'YES (oom=-900)' if lmk else ('n/a (no su)' if lmk is None else 'NO - process may die under memory pressure')}")
             L(f"  SMB:        {'RUNNING' if smb_ok else 'DOWN'}  smb://{ip}{sfx}/CameraNAS  (Windows: \\\\{ip}\\CameraNAS)")
             L(f"  HTTP:       {'RUNNING' if http_ok else 'DOWN'}  http://{ip}:8080/")
             L(f"  WS-Discover:{'RUNNING' if wsdd_ok else 'not detected'}  (Mi app scan)")
