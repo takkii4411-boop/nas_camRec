@@ -71,6 +71,7 @@ class CameraNASManager:
         else:
             self.logger.error("[FAIL] NAS failed to start")
         self.nas.print_nas_access()
+        self._start_nas_watchdog()
 
         # STEP 2: Wait for NAS to be ready
         self.logger.info("[2/5] Waiting for NAS to be ready...")
@@ -147,6 +148,34 @@ class CameraNASManager:
             except Exception as e:
                 self.logger.error(f"Storage loop error: {e}")
             time.sleep(300)
+
+    def _start_nas_watchdog(self):
+        """SMB/HTTP can die after start (Android LMK, crash, port steal).
+        Check every 60s while the app runs and bring them back - daemons
+        must never stay down unnoticed."""
+        if getattr(self, "_watchdog_started", False):
+            return
+        self._watchdog_started = True
+
+        def loop():
+            while self.running:
+                time.sleep(60)
+                try:
+                    port = self.nas._smb_port()
+                    if not self.nas._check_port(port):
+                        self.logger.warning(
+                            f"NAS watchdog: SMB port {port} down - restarting")
+                        self.nas.start_samba()
+                    if not self.nas._check_port(8080):
+                        self.logger.warning(
+                            "NAS watchdog: HTTP 8080 down - restarting")
+                        self.nas._http_server_started = False
+                        self.nas._start_http_server()
+                except Exception as e:
+                    self.logger.error(f"NAS watchdog error: {e}")
+
+        threading.Thread(target=loop, daemon=True).start()
+        self.logger.info("NAS watchdog started (SMB/HTTP auto-restart every 60s)")
 
     def _setup_signal_handlers(self):
         def signal_handler(sig, frame):

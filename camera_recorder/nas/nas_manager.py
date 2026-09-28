@@ -166,6 +166,33 @@ class NASManager:
             self.dbg(f"shim: FAILED {type(e).__name__}: {e}")
         return None
 
+    def _restore_445(self):
+        """Reboot/termux-session wipes net.ipv4.ip_unprivileged_port_start ->
+        445 becomes unbindable -> smbd silently falls back to 4460 -> Windows
+        //ip/CameraNAS and Mi app (both hardcode 445) FAIL. Restore via su."""
+        if getattr(self, "_sysctl_tried", False):
+            return
+        self._sysctl_tried = True
+        su = shutil.which("su")
+        if not su:
+            self.dbg("restore445: no su binary - keep fallback")
+            return
+        try:
+            r = subprocess.run(
+                [su, "-c", "sysctl -w net.ipv4.ip_unprivileged_port_start=0"],
+                capture_output=True, timeout=5)
+            out = r.stdout.decode(errors="replace").strip()[:80]
+            err = r.stderr.decode(errors="replace").strip()[:80]
+            self.dbg(f"restore445: rc={r.returncode} out='{out}' err='{err}'")
+        except Exception as e:
+            self.dbg(f"restore445 failed: {e}")
+        if self._port_bindable(445):
+            self.logger.info("[OK] port 445 privilege RESTORED (sysctl) - SMB on 445")
+        else:
+            self.logger.warning(
+                "port 445 still blocked - SMB falls back to 4460 "
+                "(connect with smb://<ip>:4460/CameraNAS)")
+
     def _smb_port(self):
         """445 if bindable, else high-port fallback (Android privileged port block)"""
         if not hasattr(self, "_smb_port_cache"):
@@ -173,6 +200,8 @@ class NASManager:
             env_port = os.environ.get("NAS_SMB_PORT", "").strip()
             port = int(env_port) if env_port.isdigit() else None
             if port is None:
+                if not self._port_bindable(445):
+                    self._restore_445()
                 port = 445 if self._port_bindable(445) else 4460
             self._smb_port_cache = port
             if port != 445:
@@ -955,9 +984,13 @@ class NASManager:
             self.logger.warning(f"Windows SMB setup failed: {e}")
 
     def _start_http_server(self):
-        if hasattr(self, '_http_server_started') and self._http_server_started:
-            self.dbg("http: already started (skip)")
-            return
+        if getattr(self, '_http_server_started', False):
+            if self._check_port(8080):
+                self.dbg("http: already started (skip)")
+                return
+            # thread died somehow - allow rebind below
+            self.dbg("http: flag set but port 8080 dead - rebinding")
+            self._http_server_started = False
         try:
             import http.server
             import socketserver
@@ -972,6 +1005,7 @@ class NASManager:
             import functools
             Handler = functools.partial(http.server.SimpleHTTPRequestHandler,
                                         directory=share_dir)
+            socketserver.TCPServer.allow_reuse_address = True
             httpd = socketserver.TCPServer(("0.0.0.0", port), Handler)
             threading.Thread(target=httpd.serve_forever, daemon=True).start()
             self._http_server_started = True
