@@ -3,6 +3,7 @@ import sys
 import json
 import time
 import signal
+import subprocess
 import threading
 from pathlib import Path
 from datetime import datetime
@@ -19,11 +20,32 @@ from camera_recorder.database.database import CameraDatabase
 from camera_recorder.utils.logger import LoggerManager
 from camera_recorder.utils.storage_check import get_storage_status
 
+def _acquire_wake_lock():
+    """Android sleep pauses WiFi + kills background daemons -> recordings and
+    SMB die silently after 20-30 min. termux-wake-lock now runs AUTOMATICALLY
+    at startup - no manual step. Kept held on exit so smbd/wsdd stay reachable
+    (release manually with: termux-wake-unlock)."""
+    try:
+        import shutil as _sh
+        wl = _sh.which("termux-wake-lock")
+        if not wl:
+            return
+        r = subprocess.run([wl], capture_output=True, timeout=5)
+        if r.returncode == 0:
+            print("[OK] termux-wake-lock acquired (CPU stays awake for recording + SMB)")
+        else:
+            err = r.stderr.decode(errors="replace").strip()[:80]
+            print(f"[WARN] termux-wake-lock rc={r.returncode} {err}")
+    except Exception as e:
+        print(f"[WARN] termux-wake-lock failed: {e}")
+
+
 class CameraNASManager:
     def __init__(self):
         # must run FIRST - before ports/smbd/ffmpeg get touched
         _stop_stale_instance()
         _write_pidfile()
+        _acquire_wake_lock()
         self.logger = LoggerManager.get_logger("CAMERANAS_MAIN")
         self.config = load_config()
         self.db = CameraDatabase()
