@@ -164,12 +164,48 @@ def print_env_diagnostic():
         print("  [OK] Values loaded from .env file")
     print("=" * 50)
 
+def start_background():
+    """The old manual: nohup python app.py > ~/cameras.log 2>&1 &"""
+    log_path = os.path.expanduser("~/cameras.log")
+    script = os.path.abspath(__file__)
+    with open(log_path, "a") as lf:
+        lf.write(f"\n===== app.py --bg start {datetime.now()} =====\n")
+    lf = open(log_path, "a")
+    p = subprocess.Popen(
+        [sys.executable, script],
+        stdout=lf, stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        cwd=os.path.dirname(script),
+        start_new_session=True)
+    print(f"[OK] CameraNAS started in background (pid {p.pid})")
+    print(f"     log:    {log_path}")
+    print(f"     view:   python app.py --log")
+    print(f"     stop:   pkill -f app.py   (SMB/wsdd stay up)")
+
+
+def show_log(lines=30):
+    """The old manual: grep ... ~/cameras.log | tail -10"""
+    log_path = os.path.expanduser("~/cameras.log")
+    if not os.path.exists(log_path):
+        print("No log yet - start first:  python app.py --bg")
+        return
+    with open(log_path, errors="replace") as f:
+        tail = f.readlines()[-lines:]
+    print("".join(tail), end="")
+
+
 def main():
     try:
         create_default_env()
         load_env()
     except Exception:
         pass
+    if len(sys.argv) > 1 and sys.argv[1] == "--bg":
+        start_background()
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "--log":
+        show_log()
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "--env":
         print_env_diagnostic()
         return
@@ -205,6 +241,8 @@ def main():
         print("CameraNAS System")
         print("Usage:")
         print("  python app.py           - Start the system")
+        print("  python app.py --bg      - Start in background (logs: ~/cameras.log)")
+        print("  python app.py --log     - Show last 30 log lines")
         print("  python app.py --setup   - One-command setup")
         print("  python app.py --status  - Check storage status")
         print("  python app.py --nas-status - Check NAS/Samba status")

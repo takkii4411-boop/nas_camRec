@@ -24,20 +24,22 @@ def _acquire_wake_lock():
     """Android sleep pauses WiFi + kills background daemons -> recordings and
     SMB die silently after 20-30 min. termux-wake-lock now runs AUTOMATICALLY
     at startup - no manual step. Kept held on exit so smbd/wsdd stay reachable
-    (release manually with: termux-wake-unlock)."""
+    (release manually with: termux-wake-unlock). Returns True/False/None(=n/a)."""
     try:
         import shutil as _sh
         wl = _sh.which("termux-wake-lock")
         if not wl:
-            return
+            return None
         r = subprocess.run([wl], capture_output=True, timeout=5)
         if r.returncode == 0:
             print("[OK] termux-wake-lock acquired (CPU stays awake for recording + SMB)")
-        else:
-            err = r.stderr.decode(errors="replace").strip()[:80]
-            print(f"[WARN] termux-wake-lock rc={r.returncode} {err}")
+            return True
+        err = r.stderr.decode(errors="replace").strip()[:80]
+        print(f"[WARN] termux-wake-lock rc={r.returncode} {err}")
+        return False
     except Exception as e:
         print(f"[WARN] termux-wake-lock failed: {e}")
+        return False
 
 
 class CameraNASManager:
@@ -45,7 +47,7 @@ class CameraNASManager:
         # must run FIRST - before ports/smbd/ffmpeg get touched
         _stop_stale_instance()
         _write_pidfile()
-        _acquire_wake_lock()
+        self._wake_lock = _acquire_wake_lock()
         self.logger = LoggerManager.get_logger("CAMERANAS_MAIN")
         self.config = load_config()
         self.db = CameraDatabase()
@@ -134,9 +136,34 @@ class CameraNASManager:
 
         self.logger.info("All systems started!")
         self._print_dashboard()
+        self._print_startup_summary(len(cp_threads), len(mi_threads))
         all_threads = cp_threads + mi_threads + [t_backup, t_storage]
         for t in all_threads:
             t.join()
+
+    def _print_startup_summary(self, cp_count=0, mi_count=0):
+        """Built-in status check (the old manual grep) - printed after startup,
+        visible on console and in ~/cameras.log when started with --bg."""
+        try:
+            smb_port = self.nas._smb_port()
+            smb_ok = self.nas._check_port(smb_port)
+            http_ok = self.nas._check_port(8080)
+            wsdd_ok = self.nas._check_port(5357)
+            ip = self.nas.get_samba_ip()
+            wl = getattr(self, "_wake_lock", None)
+            sfx = "" if smb_port == 445 else f":{smb_port}"
+            L = self.logger.info
+            L("========== STARTUP SUMMARY ==========")
+            L(f"  wake-lock:  {'ON (auto)' if wl else ('not installed' if wl is None else 'FAILED')}")
+            L(f"  SMB:        {'RUNNING' if smb_ok else 'DOWN'}  smb://{ip}{sfx}/CameraNAS  (Windows: \\\\{ip}\\CameraNAS)")
+            L(f"  HTTP:       {'RUNNING' if http_ok else 'DOWN'}  http://{ip}:8080/")
+            L(f"  WS-Discover:{'RUNNING' if wsdd_ok else 'not detected'}  (Mi app scan)")
+            L(f"  watchdog:   {'ON - SMB/HTTP auto-restart every 60s' if getattr(self, '_watchdog_started', False) else 'OFF'}")
+            L(f"  cameras:    CP Plus={cp_count}  Mi={mi_count}")
+            L(f"  log:        ~/cameras.log  (view: python app.py --log)")
+            L("=====================================")
+        except Exception as e:
+            self.logger.error(f"startup summary failed: {e}")
 
     def _run_mi_camera(self, cam_id, cam_info):
         recorder = MiCameraRecorder(camera_id=cam_id, storage_path=cam_info["storage_path"])
