@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.log
+*.mkv
+*.mp4
+*.ts
+Thumbs.db
+.DS_Store
